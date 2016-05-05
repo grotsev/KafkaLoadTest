@@ -1,0 +1,76 @@
+@namespace("kz.greetgo.loadtest.avro")
+protocol Simple {
+
+    enum AddressType {
+        REGISTRATION, FACTUAL
+    }
+
+    record Address {
+        union {null, AddressType} type;
+        union {null, string} country;
+        union {null, string} province;
+        union {null, string} city;
+        union {null, string} street;
+        union {null, string} house;
+        union {null, string} flat;
+    }
+
+    enum PhoneType {
+        MOBILE, WORK, HOME
+    }
+
+    record Phone {
+        string number;
+        PhoneType type;
+    }
+
+    record Contract {
+        long id;
+        long productRef;
+        @java-class("java.util.Date") int open;
+        long amount;
+    }
+
+    record Payment {
+        long id;
+        @java-class("java.util.Date") int date;
+        long amount;
+    }
+
+    record Client {
+        long id;
+        union {null, string} name;
+        union {null, string} surname;
+        union {null, string} patronymic;
+        @java-class("java.util.Date") int birthdate;
+        array<Address> addresses;
+        array<Phone> phones;
+        array<Contract> contracts;
+        array<Payment> payments;
+    }
+
+    record undefined {}
+
+/*
+    record ClientChange {
+        long id;
+        union {null, undefined, string} name;
+        union {null, undefined, string} surname;
+        union {null, undefined, string} patronymic;
+        union {null, undefined, int} birthdate;
+    }
+
+    record ClientDynamicChange {
+        long id;
+        array<FieldChange> fieldChanges;
+        union {null, undefined, string} name;
+        union {null, undefined, string} surname;
+        union {null, undefined, string} patronymic;
+        union {null, undefined, int} birthdate;
+    }
+
+    long addClient();
+
+    void changeClient(ClientChange);
+    */
+}
