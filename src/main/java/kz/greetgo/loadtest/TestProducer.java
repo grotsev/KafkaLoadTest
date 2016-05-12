@@ -6,11 +6,8 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.Arrays;
-import java.util.Map;
 import java.util.Properties;
 import java.util.Random;
-import java.util.stream.Collectors;
 
 /**
  * Created by den on 03.05.16.
