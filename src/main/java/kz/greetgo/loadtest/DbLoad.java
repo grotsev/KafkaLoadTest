@@ -35,6 +35,7 @@ public class DbLoad {
         GaleraClient galeraClient = new GaleraClient.Builder()
                 .poolName(config.getProperty("pool.name"))
                 .seeds(config.getProperty("seeds"))
+                .maxConnectionsPerHost(Integer.parseInt(config.getProperty("max.connections.per.host", "10")))
                 .database(config.getProperty("database"))
                 .user(config.getProperty("jdbc.username"))
                 .password(config.getProperty("jdbc.password"))
