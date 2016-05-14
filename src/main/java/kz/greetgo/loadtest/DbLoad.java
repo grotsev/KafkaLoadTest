@@ -1,15 +1,12 @@
 package kz.greetgo.loadtest;
 
 import com.despegar.jdbc.galera.GaleraClient;
-import com.despegar.jdbc.galera.consistency.ConsistencyLevel;
-import com.despegar.jdbc.galera.policies.ElectionNodePolicy;
 
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.sql.*;
 import java.util.*;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.*;
 import java.util.stream.Collectors;
@@ -27,13 +24,13 @@ public class DbLoad {
         config.load(configStream);
 
         int batchSize = Integer.parseInt(config.getProperty("batch.size", "1000"));
-        int tableCount = Integer.parseInt(config.getProperty("table.count", "20"));
+        int numTables = Integer.parseInt(config.getProperty("num.tables", "20"));
         int rowCount = Integer.parseInt(config.getProperty("row.count", "1000"));
         String tableName = config.getProperty("table.name", "test");
-        int numThreads = Integer.parseInt(config.getProperty("num.select.threads", "4"));
-        long sleepBeforeUpdate = Long.parseLong(config.getProperty("sleep.before.ms", "1000"));
-        long sleepAfterUpdate = Long.parseLong(config.getProperty("sleep.after.ms", "1000"));
-        long sleepFreeUpsert = Long.parseLong(config.getProperty("sleep.free.upsert.ms", "1000"));
+        int numSelectThreads = Integer.parseInt(config.getProperty("num.select.threads", "4"));
+        long wSleep = Long.parseLong(config.getProperty("write.sleep.ms", "1000"));
+        long rSleep = Long.parseLong(config.getProperty("read.sleep.ms", "1000"));
+        long rwSleep = Long.parseLong(config.getProperty("read.write.sleep.ms", "1000"));
 
         GaleraClient galeraClient = new GaleraClient.Builder()
                 .poolName(config.getProperty("pool.name"))
@@ -41,13 +38,13 @@ public class DbLoad {
                 .database(config.getProperty("database"))
                 .user(config.getProperty("jdbc.username"))
                 .password(config.getProperty("jdbc.password"))
-                .discoverPeriod(Long.parseLong(config.getProperty("discover.period.ms" ,"2000")))
+                .discoverPeriod(Long.parseLong(config.getProperty("discover.period.ms", "2000")))
                 .ignoreDonor(Boolean.parseBoolean(config.getProperty("ignore.donor", "true")))
                 .retriesToGetConnection(Integer.parseInt(config.getProperty("retries.to.get.connection", "0")))
                 .build();
         Supplier<Consumer<Consumer<Connection>>> cs = connection(galeraClient);
 
-        List<String> tables = IntStream.range(0, tableCount).mapToObj(i -> tableName + i).collect(Collectors.toList());
+        List<String> tables = IntStream.range(0, numTables).mapToObj(i -> tableName + i).collect(Collectors.toList());
 
         // create
         Consumer<Consumer<Connection>> cc = cs.get();
@@ -56,203 +53,82 @@ public class DbLoad {
                 "create table if not exists " + table + " ( id int not null primary key, val varchar(50) )"
         ))));
 
-        List<Long> mainStamps = new ArrayList<>();
-        stamp(mainStamps); // 0
+        // DbSteps
+        DbStep readStep = (PreparedStatement ps, Random rnd) -> {
+            int id = rnd.nextInt(rowCount);
+            ps.setInt(1, id);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                rs.getInt("id");
+            }
+        };
 
-        // insert
-        cc.accept(batch(batchSize, IntStream.range(0, tableCount).boxed().flatMap(
-                table -> IntStream.range(0, rowCount).mapToObj(
-                        row -> "insert " + tableName + table + " values (" + row + ", " + Math.random() + ")"
-                ))));
+        String writeSql = "insert %s values (? , ?) on duplicate key update val = ?";
+        DbStep writeStep = (PreparedStatement ps, Random rnd) -> {
+            ps.setInt(1, rnd.nextInt(2 * rowCount)); // ~50% insert/update
+            String val = Double.toString(rnd.nextDouble());
+            ps.setString(2, val);
+            ps.setString(3, val);
+            ps.executeUpdate();
+        };
 
-        stamp(mainStamps); // 1
+        // DbThreads
+        AtomicBoolean wWork = new AtomicBoolean(true);
+        AtomicBoolean rWork = new AtomicBoolean(true);
+        AtomicBoolean rwWork = new AtomicBoolean(true);
 
-        AtomicBoolean stillWork = new AtomicBoolean(true);
+        DbThread[] wThreads = IntStream.range(0, numTables).mapToObj(
+                thread -> new DbThread(cs, wWork, String.format(writeSql, tableName + thread), writeStep))
+                .toArray(DbThread[]::new);
 
-        List<Long>[] threadStamps = new List[numThreads];
+        DbThread[] rThreads = IntStream.range(0, numSelectThreads).mapToObj(
+                thread -> new DbThread(cs, rWork, selects(tables), readStep))
+                .toArray(DbThread[]::new);
 
-        { // select
-            String select = selects(tables);
-            IntStream.range(0, numThreads).forEach(selectThread -> new Thread() {
-                @Override
-                public void run() {
-                    List<Long> stamps = new ArrayList<Long>();
-                    threadStamps[selectThread] = stamps;
+        DbThread[] rwrThreads = IntStream.range(0, numSelectThreads).mapToObj(
+                thread -> new DbThread(cs, rwWork, selects(tables), readStep))
+                .toArray(DbThread[]::new);
 
-                    Random rnd = ThreadLocalRandom.current();
-                    cs.get().accept(
-                            connection -> {
-                                try (PreparedStatement ps = connection.prepareStatement(select)) {
-                                    stamp(stamps);
-                                    while (stillWork.get()) {
-                                        int id = rnd.nextInt(rowCount);
-                                        ps.setInt(1, id);
-                                        ResultSet rs = ps.executeQuery();
-                                        while (rs.next()) {
-                                            rs.getInt("id");
-                                        }
-                                        stamp(stamps);
-                                    }
-                                } catch (SQLException e) {
-                                    e.printStackTrace();
-                                }
-                            }
-                    );
-                }
-            }.start());
-        }
+        DbThread[] rwwThreads = IntStream.range(0, numTables).mapToObj(
+                thread -> new DbThread(cs, rwWork, String.format(writeSql, tableName + thread), writeStep))
+                .toArray(DbThread[]::new);
 
-        stamp(mainStamps); // 2
+        // run
+        long wBegin = stamp();
+        Arrays.stream(wThreads).forEach(thread -> thread.start());
+        Thread.sleep(wSleep);
+        wWork.set(false);
+        long wEnd = stamp();
 
-        Thread.sleep(sleepBeforeUpdate);
+        long rBegin = stamp();
+        Arrays.stream(rThreads).forEach(thread -> thread.start());
+        Thread.sleep(rSleep);
+        rWork.set(false);
+        long rEnd = stamp();
 
-        stamp(mainStamps); // 3
+        long rwBegin = stamp();
+        Arrays.stream(rwrThreads).forEach(thread -> thread.start());
+        Arrays.stream(rwwThreads).forEach(thread -> thread.start());
+        Thread.sleep(rwSleep);
+        rwWork.set(false);
+        long rwEnd = stamp();
 
-        // insert
-        cc.accept(batch(batchSize, IntStream.range(0, tableCount).boxed().flatMap(
-                table -> IntStream.range(rowCount / 2, 3 * rowCount / 2).mapToObj(
-                        row -> "insert " + tableName + table + " values (" + row + ", " + Math.random()
-                                + ") on duplicate key update val = " + Math.random()
-                ))));
-
-        stamp(mainStamps); // 4
-
-        Thread.sleep(sleepAfterUpdate);
-        stillWork.set(false);
-        Thread.sleep(1000);
-
-        stamp(mainStamps); // 5
 
         // analyze stamps
 
-        System.out.println("Insert: " + (mainStamps.get(1) - mainStamps.get(0)));
-        System.out.println("Threads create: " + (mainStamps.get(2) - mainStamps.get(1)));
-        System.out.println("Select before: " + (mainStamps.get(3) - mainStamps.get(2)));
-        System.out.println("Selects within: " + (mainStamps.get(4) - mainStamps.get(3)));
-        System.out.println("Selects after: " + (mainStamps.get(5) - mainStamps.get(4)));
+        Function<DbThread, long[]> pair = thread -> new long[]{thread.count(), thread.diration()};
+        Consumer<long[]> printPair = array -> System.out.printf("count\t%d, duration\t%d, tps\t%d\n"
+                , array[0], array[1], array[1] == 0 ? -1 : (long) (1_000_000 * array[0] / array[1]));
+        BinaryOperator<long[]> sum = (a, b) -> new long[]{a[0] + b[0], a[1] + b[1]};
 
-        class Rng implements LongPredicate {
-            private final long from;
-            private final long to;
-
-            Rng(int n) {
-                from = mainStamps.get(n);
-                to = mainStamps.get(n + 1);
-            }
-
-            @Override
-            public boolean test(long s) {
-                return from <= s && s < to;
-            }
-        }
-
-        int[] totalCount = new int[7];
-        Stream.of(threadStamps).forEach(
-                stamps -> {
-                    System.out.print("Before Within After (min max avg count tps)");
-                    IntStream.of(2, 3, 4).forEach(
-                            stage -> {
-                                long duration = mainStamps.get(stage + 1) - mainStamps.get(stage);
-                                long[] diffs = stamps.stream().mapToLong(Long::longValue).filter(new Rng(stage)).map(new Dif()).skip(1).toArray();
-                                System.out.print(String.format(" (%d %d %d %d %d)"
-                                        , LongStream.of(diffs).min().orElse(0)
-                                        , LongStream.of(diffs).max().orElse(0)
-                                        , (long) LongStream.of(diffs).average().orElse(0)
-                                        , diffs.length
-                                        , tps(diffs.length, duration)
-                                ));
-                                totalCount[stage] += diffs.length;
-                            }
-                    );
-                    System.out.println();
-                }
-        );
-        System.out.println(String.format("Total count select (before within after) (%d %d %d)", totalCount[2], totalCount[3], totalCount[4]));
-        System.out.println(String.format("Total tps select (before within after) (%d %d %d)"
-                , tps(totalCount[2], mainStamps.get(2 + 1) - mainStamps.get(2))
-                , tps(totalCount[3], mainStamps.get(3 + 1) - mainStamps.get(3))
-                , tps(totalCount[4], mainStamps.get(4 + 1) - mainStamps.get(4))
-        ));
-
-        //
-
-        Thread.sleep(sleepFreeUpsert);
-        stillWork.set(true);
-        stamp(mainStamps); // 6
-
-        { // free upsert
-            IntStream.range(0, numThreads).forEach(thread -> new Thread() {
-                @Override
-                public void run() {
-                    List<Long> stamps = new ArrayList<Long>();
-                    threadStamps[thread] = stamps;
-
-                    Random rnd = ThreadLocalRandom.current();
-                    cs.get().accept(
-                            connection -> {
-                                try (Statement st = connection.createStatement()) {
-                                    stamp(stamps);
-                                    while (stillWork.get()) {
-                                        // (2*rowCount) 50% updates and 50% inserts
-                                        String upsert = "insert " + tableName + rnd.nextInt(tableCount)
-                                                + " values (" + rnd.nextInt(2 * rowCount) + ", " + rnd.nextDouble()
-                                                + ") on duplicate key update val = " + rnd.nextDouble();
-                                        st.executeUpdate(upsert);
-                                        stamp(stamps);
-                                    }
-                                } catch (SQLException e) {
-                                    e.printStackTrace();
-                                }
-                            }
-                    );
-                }
-            }.start());
-        }
-
-        Thread.sleep(sleepFreeUpsert);
-        stillWork.set(false);
-        Thread.sleep(1000);
-        stamp(mainStamps); // 7
-
-        Stream.of(threadStamps).forEach(
-                stamps -> {
-                    System.out.print("Free upsert (min max avg count tps)");
-                    IntStream.of(6).forEach(
-                            stage -> {
-                                long duration = mainStamps.get(stage + 1) - mainStamps.get(stage);
-                                long[] diffs = stamps.stream().mapToLong(Long::longValue).filter(new Rng(stage)).map(new Dif()).skip(1).toArray();
-                                System.out.print(String.format(" (%d %d %d %d %d)"
-                                        , LongStream.of(diffs).min().orElse(0)
-                                        , LongStream.of(diffs).max().orElse(0)
-                                        , (long) LongStream.of(diffs).average().orElse(0)
-                                        , diffs.length
-                                        , tps(diffs.length, duration)
-                                ));
-                                totalCount[stage] += diffs.length;
-                            }
-                    );
-                    System.out.println();
-                }
-        );
-        System.out.println(String.format("Total count free upsert %d", totalCount[6]));
-        System.out.println(String.format("Total tps free upsert %d"
-                , tps(totalCount[6], mainStamps.get(6 + 1) - mainStamps.get(6))
-        ));
-    }
-
-    private static long tps(long count, long mks) {
-        return (long) (1_000_000 * count / mks);
-    }
-
-    private static class Dif implements LongUnaryOperator {
-        private long prev = 0;
-
-        @Override
-        public long applyAsLong(long l) {
-            long result = l - prev;
-            prev = l;
-            return result;
-        }
+        System.out.println("Write");
+        Arrays.stream(wThreads).map(pair).peek(printPair).reduce(sum).ifPresent(printPair);
+        System.out.println("Read");
+        Arrays.stream(rThreads).map(pair).peek(printPair).reduce(sum).ifPresent(printPair);
+        System.out.println("Both Read");
+        Arrays.stream(rwrThreads).map(pair).peek(printPair).reduce(sum).ifPresent(printPair);
+        System.out.println("Both Write");
+        Arrays.stream(rwwThreads).map(pair).peek(printPair).reduce(sum).ifPresent(printPair);
     }
 
     private static String selects(List<String> tables) {
@@ -309,7 +185,7 @@ public class DbLoad {
         };
     }
 
-    public static void stamp(List<Long> stamps) {
-        stamps.add(System.nanoTime() / 1000);
+    public static long stamp() {
+        return System.nanoTime() / 1000;
     }
 }
