@@ -18,15 +18,15 @@ public class DbThread extends Thread {
     private final Random rnd = ThreadLocalRandom.current();
     private final Supplier<Consumer<Consumer<Connection>>> cs;
     private final AtomicBoolean stillWork;
-    private final String sql;
+    private final int thread;
     private final DbStep step;
     private long begin, end;
     private long count = 0;
 
-    public DbThread(Supplier<Consumer<Consumer<Connection>>> cs, AtomicBoolean stillWork, String sql, DbStep step) {
+    public DbThread(Supplier<Consumer<Consumer<Connection>>> cs, AtomicBoolean stillWork, int thread, DbStep step) {
         this.cs = cs;
         this.stillWork = stillWork;
-        this.sql = sql;
+        this.thread = thread;
         this.step = step;
     }
 
@@ -34,16 +34,12 @@ public class DbThread extends Thread {
     public void run() {
         cs.get().accept(
                 connection -> {
-                    try (PreparedStatement ps = connection.prepareStatement(sql)) {
-                        begin = DbLoad.stamp();
-                        while (stillWork.get()) {
-                            step.doStep(ps, rnd);
-                            count++;
-                        }
-                        end = DbLoad.stamp();
-                    } catch (SQLException e) {
-                        e.printStackTrace();
+                    begin = DbLoad.stamp();
+                    while (stillWork.get()) {
+                        step.doStep(connection, rnd, thread, count);
+                        count++;
                     }
+                    end = DbLoad.stamp();
                 }
         );
     }

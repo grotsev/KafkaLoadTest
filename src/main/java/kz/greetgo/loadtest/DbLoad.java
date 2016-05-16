@@ -11,7 +11,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.*;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
-import java.util.stream.LongStream;
 import java.util.stream.Stream;
 
 /**
@@ -27,7 +26,7 @@ public class DbLoad {
         int numTables = Integer.parseInt(config.getProperty("num.tables", "20"));
         int rowCount = Integer.parseInt(config.getProperty("row.count", "1000"));
         String tableName = config.getProperty("table.name", "test");
-        int numSelectThreads = Integer.parseInt(config.getProperty("num.select.threads", "4"));
+        int numThreads = Integer.parseInt(config.getProperty("num.threads", "4"));
         long wSleep = Long.parseLong(config.getProperty("write.sleep.ms", "1000"));
         long rSleep = Long.parseLong(config.getProperty("read.sleep.ms", "1000"));
         long rwSleep = Long.parseLong(config.getProperty("read.write.sleep.ms", "1000"));
@@ -54,23 +53,33 @@ public class DbLoad {
                 "create table if not exists " + table + " ( id int not null primary key, val varchar(50) )"
         ))));
 
+
         // DbSteps
-        DbStep readStep = (PreparedStatement ps, Random rnd) -> {
-            int id = rnd.nextInt(rowCount);
-            ps.setInt(1, id);
-            ResultSet rs = ps.executeQuery();
-            while (rs.next()) {
-                rs.getInt("id");
+        String readSql = selects(tables);
+        DbStep readStep = (Connection connection, Random rnd, int thread, long count) -> {
+            try (PreparedStatement ps = connection.prepareStatement(readSql)) {
+                int id = rnd.nextInt(rowCount);
+                ps.setInt(1, id);
+                ResultSet rs = ps.executeQuery();
+                while (rs.next()) {
+                    rs.getInt("id");
+                }
+            } catch (SQLException e) {
+                e.printStackTrace();
             }
         };
 
-        String writeSql = "insert %s values (? , ?) on duplicate key update val = ?";
-        DbStep writeStep = (PreparedStatement ps, Random rnd) -> {
-            ps.setInt(1, rnd.nextInt(2 * rowCount)); // ~50% insert/update
-            String val = Double.toString(rnd.nextDouble());
-            ps.setString(2, val);
-            ps.setString(3, val);
-            ps.executeUpdate();
+        String writeSql = "insert " + tableName + "%d values (? , ?) on duplicate key update val = ?";
+        IntFunction<DbStep> writeStep = maxId -> (Connection connection, Random rnd, int thread, long count) -> {
+            try (PreparedStatement ps = connection.prepareStatement(String.format(writeSql, count % numTables))) {
+                ps.setInt(1, rnd.nextInt(maxId) * numThreads + thread);
+                String val = Double.toString(rnd.nextDouble());
+                ps.setString(2, val);
+                ps.setString(3, val);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                e.printStackTrace();
+            }
         };
 
         // DbThreads
@@ -78,20 +87,20 @@ public class DbLoad {
         AtomicBoolean rWork = new AtomicBoolean(true);
         AtomicBoolean rwWork = new AtomicBoolean(true);
 
-        DbThread[] wThreads = IntStream.range(0, numTables).mapToObj(
-                thread -> new DbThread(cs, wWork, String.format(writeSql, tableName + thread), writeStep))
+        DbThread[] wThreads = IntStream.range(0, numThreads).mapToObj(
+                thread -> new DbThread(cs, wWork, thread, writeStep.apply(rowCount)))
                 .toArray(DbThread[]::new);
 
-        DbThread[] rThreads = IntStream.range(0, numSelectThreads).mapToObj(
-                thread -> new DbThread(cs, rWork, selects(tables), readStep))
+        DbThread[] rThreads = IntStream.range(0, numThreads).mapToObj(
+                thread -> new DbThread(cs, rWork, thread, readStep))
                 .toArray(DbThread[]::new);
 
-        DbThread[] rwrThreads = IntStream.range(0, numSelectThreads).mapToObj(
-                thread -> new DbThread(cs, rwWork, selects(tables), readStep))
+        DbThread[] rwrThreads = IntStream.range(0, numThreads).mapToObj(
+                thread -> new DbThread(cs, rwWork, thread, readStep))
                 .toArray(DbThread[]::new);
 
-        DbThread[] rwwThreads = IntStream.range(0, numTables).mapToObj(
-                thread -> new DbThread(cs, rwWork, String.format(writeSql, tableName + thread), writeStep))
+        DbThread[] rwwThreads = IntStream.range(0, numThreads).mapToObj(
+                thread -> new DbThread(cs, rwWork, thread, writeStep.apply(2 * rowCount))) // ~50% insert/update
                 .toArray(DbThread[]::new);
 
         // run
@@ -119,7 +128,7 @@ public class DbLoad {
 
         Function<DbThread, long[]> pair = thread -> new long[]{thread.count(), thread.diration()};
         Consumer<long[]> printPair = array -> System.out.printf("count\t%d, duration\t%d, tps\t%d\n"
-                , array[0], array[1], array[1] == 0 ? -1 : (long) (1_000_000 * array[0] / array[1]));
+                , array[0], array[1], array[1] == 0 ? -1 : (long) (1000 * array[0] / array[1]));
         BinaryOperator<long[]> sum = (a, b) -> new long[]{a[0] + b[0], a[1] + b[1]};
 
         System.out.println("Write");
@@ -187,6 +196,6 @@ public class DbLoad {
     }
 
     public static long stamp() {
-        return System.nanoTime() / 1000;
+        return System.currentTimeMillis();
     }
 }
