@@ -24,6 +24,7 @@ public class DbLoad {
 
         int batchSize = Integer.parseInt(config.getProperty("batch.size", "1000"));
         int numTables = Integer.parseInt(config.getProperty("num.tables", "20"));
+        int numColumns = Integer.parseInt(config.getProperty("num.columns", "2"));
         int rowCount = Integer.parseInt(config.getProperty("row.count", "1000"));
         String tableName = config.getProperty("table.name", "test");
         int numThreads = Integer.parseInt(config.getProperty("num.threads", "4"));
@@ -50,7 +51,9 @@ public class DbLoad {
         Consumer<Consumer<Connection>> cc = cs.get();
         cc.accept(batch(batchSize, tables.stream().flatMap(table -> Stream.of(
                 "drop table if exists " + table,
-                "create table if not exists " + table + " ( id int not null primary key, val varchar(50) )"
+                "create table if not exists " + table + " ( id int not null primary key"
+                        + IntStream.range(0, numColumns).mapToObj(i -> ", val" + i + " varchar(50)").collect(Collectors.joining())
+                        + " )"
         ))));
 
 
@@ -69,13 +72,18 @@ public class DbLoad {
             }
         };
 
-        String writeSql = "insert " + tableName + "%d values (? , ?) on duplicate key update val = ?";
+        String writeSql = "insert " + tableName + "%d values (? "
+                + IntStream.range(0, numColumns).mapToObj(i -> ", ?").collect(Collectors.joining())
+                + ") on duplicate key update "
+                + IntStream.range(0, numColumns).mapToObj(i -> "val" + i + " = ?").collect(Collectors.joining(", "));
         IntFunction<DbStep> writeStep = maxId -> (Connection connection, Random rnd, int thread, long count) -> {
             try (PreparedStatement ps = connection.prepareStatement(String.format(writeSql, count % numTables))) {
                 ps.setInt(1, rnd.nextInt(maxId) * numThreads + thread);
-                String val = Double.toString(rnd.nextDouble());
-                ps.setString(2, val);
-                ps.setString(3, val);
+                for (int i = 0; i < numColumns; i++) {
+                    String val = Double.toString(rnd.nextDouble());
+                    ps.setString(i + 2, val);
+                    ps.setString(i + 2 + numColumns, val);
+                }
                 ps.executeUpdate();
             } catch (SQLException e) {
                 e.printStackTrace();
